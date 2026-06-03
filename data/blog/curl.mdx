@@ -115,9 +115,9 @@ fi
 
 ### ステータスコードを変数で取る
 ```bash
-status=$(curl -s -o /dev/null -w "%{http_code}" https://example.com)
+status=$(curl -s -o /dev/null -w "%\{http_code\}" https://example.com)
 ```
--w "%{http_code}" でステータスコードだけを標準出力に出せる。-o /dev/null でボディを捨て、status 変数で取り扱う。
+-w "%\{http_code\}" でステータスコードだけを標準出力に出せる。-o /dev/null でボディを捨て、status 変数で取り扱う。
 
 ### 計測結果をログに残す
 ```bash
