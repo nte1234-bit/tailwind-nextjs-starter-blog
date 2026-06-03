@@ -1,13 +1,11 @@
 ---
-title: 'curlコマンドについて'
-date: 2026-06-03T13:54:00Z
-lastmod: '2026-06-03'
-tags: ['linux', 'command', 'curl']
+title: 'インフラエンジニアの curl ― 運用・監視で実際に使うオプション'
+date: '2026-06-03'
+tags: ['linux', 'curl', 'sre', 'monitoring']
 draft: false
-summary: ''
-layout: PostSimple
-bibliography: references-data.bib
+summary: 'curl を「通信の状態を見るツール」として運用・監視に使う実例。-v、-w、--resolve など、実務で使うオプションをインフラエンジニアの視点で整理する。'
 ---
+
 ## 書こうと思ったきっかけ
 最近、APIやっていて使うことがあるが深く理解できていない
 -Iで詳細な情報とれる、くらいしか覚えてない
@@ -16,3 +14,127 @@ bibliography: references-data.bib
 ## なんの略なの？
 
 ## curlの歴史
+
+# インフラエンジニアの curl ― 運用・監視で実際に使うオプション
+curl は誰もが知っているコマンドだ。  
+でも、業務で使い倒している人と、-I でヘッダだけ叩いたことがある人の差は意外と大きい。  
+
+私はインフラ寄りで Java の Web アプリ開発をやっていた時期、  
+AWS と Tomcat の上で運用していたサービスのデバッグや疎通確認で curl を頻繁に叩いていた。  
+最初は「とりあえず叩いてレスポンスを見る」だけだったが、徐々に「curl は通信の状態を見るツール」として使うようになった。  
+
+これがインフラ寄りに進むうえで地味に効いた。
+
+この記事では、運用・監視の現場で実際に使う curl のオプションを、何が見えるかという観点で整理する。
+
+## 監視・運用で curl を使う前提
+curl の出力は単なるレスポンスボディだけではない。  
+-v を付ければプロトコル全体のやり取りが見えるし、-w を付ければ各フェーズの処理時間が取れる。  
+これを構造化された情報として扱うことで、シェルから「通信の状態」を把握できる。  
+業務シーンとしては大きく4つある。
+
+- 疎通確認      : そもそも繋がるか。DNS は引けているか。TLS は確立できるか
+- 遅延の分解    : 遅いとして、どのレイヤーで遅いのか
+- 証明書の確認  : 証明書の有効期限、SAN、チェーンは正しいか
+- ヘルスチェック: 監視スクリプトに組み込んで死活監視する
+
+これらを curl 1つで全部やれる。順に見ていく。
+
+## -v: TLSハンドシェイクとHTTPヘッダを全部見る
+-v は verbose モードで、通信のやり取りをすべて出力する。
+bashcurl -v https://example.com
+出力に含まれる主要な情報は以下の通り：
+
+DNS 解決の結果（解決した IP アドレス）
+TCP 接続の確立
+TLS ハンドシェイクの内容（プロトコルバージョン、暗号スイート、サーバ証明書のチェーン）
+送信したHTTPリクエストヘッダ（> で始まる行）
+受信したHTTPレスポンスヘッダ（< で始まる行）
+
+たとえば証明書周りの障害対応では、-v の出力で次のような情報が読み取れる。
+*  subject: CN=example.com
+*  start date: Apr  1 00:00:00 2026 GMT
+*  expire date: Jul  1 00:00:00 2026 GMT
+*  subjectAltName: host "example.com" matched cert's "example.com"
+*  SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384
+「証明書が期限切れになっている」「SAN に対象ドメインが含まれていない」「TLS バージョンが古い」のような問題は、ここを読めば数秒で判別できる。
+
+## -w: 時間を計測する（運用監視の主役）
+-w（--write-out）は、curl 終了時に指定したフォーマットで情報を出力する。本記事の中で最も使いどころが多いオプションかもしれない。
+特に 時間計測 の用途で強力だ。
+```bash
+curl -o /dev/null -s -w \
+  "namelookup: %{time_namelookup}\n\
+   connect: %{time_connect}\n\
+   appconnect: %{time_appconnect}\n\
+   starttransfer: %{time_starttransfer}\n\
+   total: %{time_total}\n" \
+   https://example.com
+```
+```text
+出力例：
+namelookup: 0.025
+connect: 0.063
+appconnect: 0.198
+starttransfer: 0.412
+total: 0.485
+```
+これらの数字は 累積時間で、各フェーズの所要時間は差分で求められる。  
+たとえば time_namelookup だけ突出していれば DNS が怪しい。  
+time_starttransfer - time_appconnect が大きければアプリ側の問題。原因の切り分けが格段に速くなる。
+
+## --resolve: DNS解決を上書きしてテストする
+--resolve は、特定のホスト名に対する名前解決の結果を、コマンドライン上で上書きできる。
+bashcurl --resolve example.com:443:192.0.2.10 https://example.com
+これは「example.com を 192.0.2.10 として扱う」という指示。/etc/hosts を書き換えるのと似たことを、1コマンドで一時的に実現できる。
+使い所：
+
+-k （証明書検証スキップ）と組み合わせがちだが、本番作業では --resolve で名前ベース疎通を確認する方が運用上の意味がある。証明書チェーンも含めて検証できるからだ。
+
+## -I と証明書周り: TLS証明書の確認
+-I（大文字）は HEAD リクエストだけ送ってレスポンスヘッダを返す。
+```bash
+curl -I https://example.com
+```
+レスポンスボディは取らないので、軽量に「サーバが生きているか」「どんなヘッダを返すか」を見られる。  
+ただし、証明書の詳細を見たい時は -v の方が情報量が多い。  
+証明書の有効期限・発行者・SAN を見たいなら -v で TLS ハンドシェイクの出力を読む方が確実だ。
+もっと詳しく証明書を見たい時は、curl と組み合わせず openssl s_client を使うのが定石だが、それは別の話。
+
+## 運用スクリプトに組み込むパターン
+最後に、curl をシェルスクリプトに組み込む際の頻出パターンをまとめる。
+### 死活監視
+```bash
+if curl -s -f -o /dev/null --max-time 10 https://example.com/health; then  
+  echo "OK"
+else
+  echo "NG"
+  exit 1
+fi
+```
+
+- -s: silent モード（進捗を出さない）
+- -f: HTTPエラー（4xx, 5xx）を終了コード 22 で返す。これがないと、404 でも curl 自体は成功扱いになる
+- -o /dev/null: レスポンスボディを捨てる
+- --max-time 10: タイムアウト10秒
+
+特に -f は重要だ。  
+これがないと、HTTP のステータスコードに関係なく curl の終了コードが 0 になってしまい、スクリプトで判定できない。
+
+### ステータスコードを変数で取る
+```bash
+status=$(curl -s -o /dev/null -w "%{http_code}" https://example.com)
+```
+-w "%{http_code}" でステータスコードだけを標準出力に出せる。-o /dev/null でボディを捨て、status 変数で取り扱う。
+
+### 計測結果をログに残す
+```bash
+curl -s -o /dev/null \
+  -w "%{time_namelookup},%{time_connect},%{time_starttransfer},%{time_total}\n" \
+  https://example.com >> /var/log/latency.csv
+```
+CSV で出力すれば、後で awk や pandas で集計・グラフ化できる。Datadog や CloudWatch に投げる前段としても使える。
+
+## まとめ
+curl は単に「叩く」だけのツールではない。-v でプロトコルの状態が見え、-w で時間が分解され、--resolve で名前解決を上書きできる。これらを使うと、curl は「通信のレイヤーを見る目」になる。
+インフラ寄りに進むなら、-w で時間を分解する習慣だけでも身につけておくと、障害対応・パフォーマンス調査の速度が変わる。
