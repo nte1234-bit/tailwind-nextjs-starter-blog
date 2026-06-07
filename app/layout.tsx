@@ -113,6 +113,12 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           async
           defer
         />
+        <Script
+          src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3103633426677030"
+          crossorigin="anonymous"
+          async
+          defer
+        />
       </body>
     </html>
   )
