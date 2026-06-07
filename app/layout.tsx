@@ -1,6 +1,7 @@
 import 'css/tailwind.css'
 import 'pliny/search/algolia.css'
 import 'remark-github-blockquote-alert/alert.css'
+import Script from 'next/script'
 
 import { Space_Grotesk } from 'next/font/google'
 import { Analytics, AnalyticsConfig } from 'pliny/analytics'
@@ -105,6 +106,13 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             <Footer />
           </SectionContainer>
         </ThemeProviders>
+        <Script
+          id="hs-script-loader"
+          strategy="afterInteractive"
+          src="https://js-na2.hs-scripts.com/246420688.js"
+           async
+           defer
+        />
       </body>
     </html>
   )
