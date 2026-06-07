@@ -110,8 +110,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           id="hs-script-loader"
           strategy="afterInteractive"
           src="https://js-na2.hs-scripts.com/246420688.js"
-           async
-           defer
+          async defer
         />
       </body>
     </html>
