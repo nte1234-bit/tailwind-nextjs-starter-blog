@@ -4,6 +4,7 @@ date: '2026-06-14'
 tags: ['Nutanix', 'DR', 'SRE', 'infrastructure']
 draft: true
 summary: 'Nutanix の DR を Protection Domain（レガシー）から Recovery Plan（Prism Central / v4）へ移行するとき、リカバリ方式の分類・世代指定復旧・フェイルオーバー失敗時の後処理がどう変わるかを、現場目線で整理する。製品仕様の網羅ではなく移行判断と運用にフォーカス。'
+images: ['/static/images/og-nutanix-dr-v4.png']
 ---
 
 製品仕様の網羅と機能ごとの手順スクリーンショットは、公式ドキュメントや既存の良質な解説（製品仕様まわりは gowatana 氏の記事が詳しい）に譲る。本記事が扱うのは、その一段上のレイヤー — **Nutanix の DR を Protection Domain（以下 PD）ベースの旧方式から Recovery Plan ベースの新方式へ移行するとき、リカバリ設計の意思決定がどう変わるか**だ。
