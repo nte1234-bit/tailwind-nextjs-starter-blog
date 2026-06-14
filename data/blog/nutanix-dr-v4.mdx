@@ -1,0 +1,170 @@
+---
+title: 'Protection Domain から Recovery Plan へ — Nutanix DR を v2/v4 で移行するときのリカバリ設計整理'
+date: '2026-06-14'
+tags: ['Nutanix', 'DR', 'SRE', 'infrastructure']
+draft: true
+summary: 'Nutanix の DR を Protection Domain（レガシー）から Recovery Plan（Prism Central / v4）へ移行するとき、リカバリ方式の分類・世代指定復旧・フェイルオーバー失敗時の後処理がどう変わるかを、現場目線で整理する。製品仕様の網羅ではなく移行判断と運用にフォーカス。'
+---
+
+製品仕様の網羅と機能ごとの手順スクリーンショットは、公式ドキュメントや既存の良質な解説（製品仕様まわりは gowatana 氏の記事が詳しい）に譲る。本記事が扱うのは、その一段上のレイヤー — **Nutanix の DR を Protection Domain（以下 PD）ベースの旧方式から Recovery Plan ベースの新方式へ移行するとき、リカバリ設計の意思決定がどう変わるか**だ。
+
+概念解説（RPO/RTO とは、DR とは）や機能一覧はすでに飽和している。一方で「PD → Recovery Plan 移行で、(1) リカバリ方式の分類、(2) 世代指定復旧、(3) フェイルオーバー失敗時の後処理 がどう変わるか」を一本につないだ現場目線の整理は、意外と埋まっていない。本記事はそこを埋める。
+
+> 注：本記事は公開情報のみに基づく一般化であり、特定の顧客環境の構成・数値には依拠しない。挙動の細部は AOS / Prism Central のバージョンで差が出るため、自環境での検証を前提に読んでほしい。
+
+## TL;DR (English)
+
+This article organizes the design decisions involved in migrating Nutanix DR from the legacy **Protection Domain (PD)** model to the modern **Recovery Plan** model. Key points:
+
+- **PD and Recovery Plan live in different worlds.** PD is a Prism Element construct managed via legacy (v2.0) APIs; Recovery Plan (Protection Policy + Recovery Plan, formerly "Leap") is a Prism Central construct exposed via the v4 API. The v4 API is Prism-Central-only, and legacy APIs (v0.8/v1/v2/v3) are slated for deprecation starting the Q4 CY2026 upgrade release. [1][2][3][4]
+- **Recovery method ≈ "pilot light," not "warm standby."** Recovery Plan failover creates VMs at the recovery site from the latest replicated recovery point (via redirect-on-write instant clone) and boots them in sequence — not pre-placed VMs that just power on. The instant clone makes RTO shorter than a textbook pilot light, so the AWS DR tier taxonomy applies only as a borrowed lens. [5][6][7][8]
+- **Point-in-time (generation) recovery is possible without PD.** Recovery Plan failover always uses the latest recovery point, but you can restore an individual VM from any retained recovery point through Prism Central (Data Protection → VM Recovery Points / Recoverable Entities). So PD is, in principle, unnecessary under v4. [9][10][11]
+- **Failure handling is mostly manual.** Only test failover has a dedicated cleanup (Clean-up Test Entities / CLEANUP action). A partially failed production failover has no guaranteed auto-rollback for the half-created recovery-side VMs — remediate-and-retry or delete-and-retry, and watch for name/IP collisions. [12][13][14]
+
+The body below is in Japanese. Diagrams and the full source list are language-neutral.
+
+## DR の最小限の語彙（AWS のレンズを借りる）
+
+本題に入る前に、分類のための共通言語だけ置く。深掘りはしない。
+
+- **バックアップ / リストア**：データを別の場所に保管し、必要時に復元する。
+- **RPO（Recovery Point Objective）**：どこまでのデータ損失を許容するか（=直近どの時点まで戻せるか）。
+- **RTO（Recovery Time Objective）**：復旧にどれだけ時間をかけられるか。
+- **DR 方式のスペクトラム**：コスト・RPO・RTO のトレードオフで、バックアップ/リストア → パイロットライト → ウォームスタンバイ → マルチサイト アクティブ/アクティブ の順に「速く・新しく・高く」なる。これは元々 AWS の整理だが [5]、本記事では Nutanix の方式を分類するための借りものとして使う。
+
+加えて、SRE の文脈で重要な区別を一つ。**バックアップ（アプリに戻せる、災害時のリカバリ用）とアーカイブ（アプリに戻せない、コンプライアンス用）は別物**であり、DR で力を入れるべきは「戻して動かせること（restore / recovery）」の側だ。容量を確保しただけでは復旧能力にならない。
+
+## Nutanix DR の二世代：住む世界が違う
+
+ここが移行記事の背骨になる。PD と Recovery Plan は単なる新旧の機能差ではなく、**管理面と API の世代が違う**。
+
+- **Protection Domain**：Prism Element 側の構成要素。その操作は Prism Element 専用のレガシー v2.0 API（クラスタローカルな操作用）の世界に属する。[1][4]
+- **Protection Policy + Recovery Plan（= Nutanix DR、旧称 Leap）**：Prism Central 側に置かれた現代の DR 機能。Protection Policy がレプリケーション（RPO・保持・対象）を、Recovery Plan が起動順序・ネットワークマッピング・runbook を担う。[2][6]
+- **v4 API は Prism Central 専用**で、全管理操作の推奨 API。そして v4 を Prism Element に展開する計画はない。[1][4]
+- **レガシー API（v0.8 / v1 / v2 / v3）は、CY2026 Q4 予定の AOS・PC アップグレードリリースを起点に deprecate 予定**。deprecate は即時削除ではなく、当面は動作するがサポート対象外になる、という意味だ。[3][4][15]
+
+つまり「v2 方式 = PD = Prism Element / レガシー API の世界」「v4 方式 = Recovery Plan = Prism Central / v4 API の世界」であり、移行は手順の置き換えである以上に**管理プレーンの世代交代**だ。この視点を持つと、後段の「PD は要るのか」という問いが素直に解ける。
+
+## リカバリ方式の分類：Recovery Plan は何相当か
+
+旧方式と新方式を、借りてきた AWS のスペクトラムに当てはめる。
+
+**v2（PD）の方式**：Protection Domain のスナップショットから VM を一つずつリストアする。直列・手動で、**バックアップ/リストア方式に該当、RTO が長い**。
+
+**v4（Recovery Plan）の方式**：Protection Policy が継続的にリカバリポイント（スナップショット）をレプリケーションし、failover 実行時に最新のリカバリポイントから VM を生成して、Recovery Plan のブートシーケンスに従って起動する。ネットワーク/IP マッピングの再設定や post-boot スクリプトもこのとき適用される。[2][6][7][8]
+
+ここで効くのが VM 生成の中身だ。Nutanix は redirect-on-write による instant clone で VM を生成するため、フルコピーを待たずほぼ瞬時に立ち上がる。[5][6] failover 前の復旧側の状態は「データ（リカバリポイント）のみ存在・VM は未稼働」になる。
+
+判断軸で整理すると：
+
+- **ウォームスタンバイ**（セカンダリに VM 事前配置済み・電源投入のみ）には該当しない。
+- **パイロットライト**（データのみレプリケーション済み・VM を新規生成から始める）に該当する。
+
+ただし留保が要る。instant clone で生成が瞬時なため、**RTO は教科書的なパイロットライトより短く出る**。AWS の4分類は AWS 基準のモデルであって、Nutanix に当てるのは借用にすぎない。「常時稼働コアを持たない＝パイロットライト寄りだが、生成が瞬時＝RTO はウォームスタンバイ並み」という、軸の間に落ちる挙動になる。レビューや設計書では「分類は taxonomy の借用であり厳密な 1:1 ではない」と一行添えておくと安全だ。
+
+なお failover には planned / unplanned があり、RPO の扱いが変わる。**planned failover は停止時に最終リカバリポイントを作成するためデータロスは実質ゼロ**、**unplanned failover はレプリ済みの最新リカバリポイントを使うため Protection Policy の RPO 設定ぶん（非同期ならその間隔まで）のロスを許容**する。[5][7]
+
+## 世代指定リカバリはどちらでやるか
+
+「過去の特定時点に戻す」要件があると、ここで誤解が生まれやすい。
+
+**Recovery Plan の failover は常に最新のリカバリポイントを使う。** [7][5] では世代指定（古い健全な時点への巻き戻し、たとえば破損・汚染の前に戻す）は PD でしかできないのか、というとそうではない。
+
+**世代指定復旧は Prism Central の中で完結する。** VM は選択した任意のリカバリポイントの状態で、ローカルにもリモートにも復元できる。[9] 操作経路は PC > Data Protection > VM Recovery Points（あるいは VM 詳細 > Recovery Points / Recoverable Entities）から特定世代を選んでリストア/クローンする。[9][10]
+
+ここで一つ重要な制約がある。**リカバリポイントは Prism Central の構成要素で、Prism Element はそれを認識しない。さらに VM が Protection Domain 配下にあると、PC 側の Create Recovery Point はグレーアウトする。**[9] つまり PD と PC リカバリポイントは同一 VM 上で半ば排他であり、同じエンティティに両方の保護を二重がけする設計は濁る。プレーンはどちらかに寄せるべきだ。
+
+結論として、**世代復旧を理由に PD を残す必要はない**。世代指定は v4/PC 側で完結する。
+
+## では PD は v4 で必要か → 原則不要
+
+世代復旧が PC で完結する以上、DR 用途で PD を残す積極的理由はほぼ消える。前段の「住む世界が違う」と合わせると、v4 へ寄せること自体が PD を捨てることと同義になる。v4 の API 面から見れば、そもそも PD はそこに存在しない（PD を叩くにはレガシー PE API に降りる必要がある）。
+
+ただし、無条件で捨てていいとは言わない。退役の前に潰すべき論点を挙げておく（いずれも自環境のバージョンで要検証）：
+
+1. **Metro Availability / 同期レプリケーション**：歴史的に PD ベースの領域。PC ベース DR に parity があるかを確認する。ここだけは PD が残る現実的な可能性がある。
+2. **特定ワークロード / エンティティ種別、NearSync の細部**：代替可否を確認。
+3. **Prism Central なし構成**：PC が無いと Protection Policy / Recovery Plan は使えず PD のみになる。ただし v4 移行を語る時点で PC は前提のはず。
+
+そして、PD を残す**正当な論理は一つだけ**ある。「同一の DR ソフトウェア機構に全依存するのは、その機構自体のバグに弱い」という防御的多重化（defense-in-depth）だ。独立した第二のデータコピーを別機構で持ちたいなら、PD（や別のバックアップ製品）を残す選択はあり得る。ただしこれは二重管理と枯れていくスタックのコストを承知のうえで取る**意識的な設計判断**であって、デフォルトではない。
+
+## 実運用フロー：被災判定からフェイルオーバー、そして失敗時
+
+DR は「成功する前提のフロー」だけ描いても使えない。リカバリ中に障害が起きたときの分岐まで含めて runbook になる。
+
+```
+被災判定
+  ↓
+Recovery Plan でリカバリ（最新リカバリポイント）
+  ├─ 分岐A 一過性 / オーケストレーション失敗 → 是正して再実行
+  ├─ 分岐B 最新リカバリポイントが不良        → PC で世代指定リカバリポイントリストア
+  └─ 分岐C PC / 復旧サイト自体の障害         → PC 自体を Objects バックアップから復元
+```
+
+ポイントは「リカバリ中に障害 → 世代指定で復旧」と短絡しないことだ。世代指定が意味を持つのは分岐 B だけで、失敗の中身によって正しい対処が違う。
+
+- **分岐A：オーケストレーション / 一過性の失敗**（一部 VM が起動しない、ステージ停滞、re-IP / ネットワーク失敗、リソース不足。データ自体は健全）。方式を変えず、原因を是正して再実行する。たとえば NIC が切断状態で起動失敗するケースでは、正しいポートグループを手動で割り当て直してから Recovery Plan を再実行する、という流れになる。[12] 世代指定に切り替えても、データは悪くないので解決にならない。
+- **分岐B：データ / リカバリポイント自体の失敗**（最新のリカバリポイントが破損・不完全、あるいは汚染済み。古い健全な世代が要る）。ここが唯一「世代指定」が効くケース。PC のリカバリポイント世代指定リストアで対応する。
+- **分岐C：復旧サイト / コントロールプレーン自体の障害**（復旧クラスタの劣化、Prism Central がダウン）。これは「DR の DR」であり PD では解けない。**Prism Central 自体を Nutanix Objects 上の point-in-time バックアップから復元できる（最大 30 日分の復元ポイント、RTO 90 分）**ので [11]、PC を保護対象に含めておくのが正解だ。
+
+## フェイルオーバー失敗時の後処理：不良 VM の扱い
+
+失敗フローの最後に、もう一段見落としやすい後処理がある。**失敗時にできた不良 VM の掃除**だ。これも「どの失敗か」で扱いが変わる。
+
+**テストフェイルオーバー**は、隔離ネットワークに「Nutanix-Test」プレフィックスの複製 VM を作る。テスト後は Recovery Plan の **Clean-up Test Entities** で削除する。[13] API / Ansible（nutanix.ncp の `ntnx_recovery_plan_jobs`）にも、テスト作成エンティティ掃除用の **CLEANUP** アクションがある。[14] テスト runbook には必ずこのクリーンアップを入れる。
+
+**本番フェイルオーバーが成功した場合**、掃除されるのはソース側だ。planned failover は元 VM を自動削除して二重稼働を防ぎ [5][6]、unplanned failover では元 VM がオーファンとして残るが、プライマリ復帰後に自動で掃除される。[13] 復旧側に出来た VM は新しい本番なので消さない。
+
+問題は**本番フェイルオーバーが途中で失敗した場合**だ。復旧側に「作られたが起動しない / NIC 切断 / 中途半端」な VM が残る。これに対する専用の自動ロールバックは無い（CLEANUP はテスト用にスコープされている）。選択肢は二つ：
+
+- **その場で是正して再実行**：原因が設定ミス・ネットワーク不一致なら、削除せず直して再ランする。
+- **不良 VM を削除してから再実行**：中途半端な生成物が再ランで衝突するなら、先に消す。
+
+runbook には、再実行の前に挟む後処理ブロックとして次を持たせる：
+
+1. 復旧側エンティティの棚卸し（何が作られたか、起動状態・NIC・IP を確認）
+2. 原因が設定 / ネットワークなら是正して再実行（削除不要）。中途半端な生成物が残るなら削除して再実行。
+3. **衝突チェック**：失敗試行が作った VM が、再ランで使う名前・IP を握っていないか確認する（最も踏みやすい）。リカバリポイントからのクローンは新しい UUID で作られるため、UUID では重複排除されず別エンティティとして残る点に注意。[16]
+4. 資源リーク確認：DR サイトの compute / storage を食う孤児 VM が残っていないか。
+
+VM 数が増えると GUI での手削除は破綻する。削除・再実行は v4 API / Ansible（nutanix.ncp の CLEANUP・VM 削除）でスクリプト化し、テストの Clean-up も自動化しておけば、本番途中失敗時にも同じ部品を流用できる。[14]
+
+## まとめ：移行の意思決定として
+
+- v2（PD / Prism Element / レガシー API）から v4（Recovery Plan / Prism Central / v4 API）への移行は、リカバリ手順の差であると同時に**管理プレーンの世代交代**である。
+- リカバリ方式は **バックアップ/リストア → パイロットライト相当**へ変わり、RTO が短縮される（ただし AWS taxonomy の借用であり厳密な 1:1 ではない、という留保つき）。
+- **世代指定復旧は Prism Central 側で完結する**ため、DR 用途の Protection Domain は原則不要。退役の前に Metro / parity / 世代復旧要件 / cleanup 手順を自環境のバージョンで確認する。
+- **失敗時の後処理、特に本番途中失敗の不良 VM は手動領域**。「是正して再実行 or 削除して再実行 ＋ 衝突チェック」を runbook に明示する。
+
+新しい方が全部正義、ではない。PD（やバックアップ層）は世代保持や独立機構による多重化という別レイヤーの仕事を持ちうる。重要なのは「recovery（最新で速く戻す）」と「世代保持 / archive」を別レイヤーとして設計し、それぞれに正しい道具を当てることだ。
+
+---
+
+## 参考（References）
+
+### 一次 / 公式・権威
+
+1. The Nutanix Bible — REST APIs（v4 は Prism Central 専用で全用途の推奨 API、v2.0 は Prism Element 専用のレガシー）. https://www.nutanixbible.com/19a-rest-apis.html
+2. The Nutanix Bible — Book of DR Services（Protection Policy ＋ Recovery Plan の構成、retention の linear / roll-up）. https://www.nutanixbible.com/13a-book-of-dr-services.html
+3. Nutanix.dev — API Reference v4 Introduction（レガシー API v0.8/v1/v2/v3 は CY2026 Q4 のアップグレードリリースを起点に deprecate・サポート終了予定）. https://www.nutanix.dev/api-reference-v4/
+4. Nutanix.dev — REST API and SDK Versions（各 API バージョンの用途と Prism Element / Prism Central の別）. https://www.nutanix.dev/api-versions/
+9. Nutanix Community — Snapshot と Recovery Point の違い（VM は任意の選択リカバリポイントの状態で復元可能、リカバリポイントは PC の構成要素、PD 配下だと PC の Create Recovery Point がグレーアウト）. https://next.nutanix.com/intelligent-operations-26/what-s-the-difference-between-snapshot-recovery-points-37721
+10. Nutanix Portal — Nutanix DR (pc.2024.2) VM Recovery Points View（PC の Data Protection > VM Recovery Points）. https://portal.nutanix.com/page/documents/details?targetId=Disaster-Recovery-DRaaS-Guide-vpc_2024_2%3Aecd-ecdr-recoverypoints-ui-pc-r.html
+11. Nutanix Portal — Prism Central を Nutanix Objects 上の point-in-time バックアップから復元（最大 30 日分、RTO 90 分）. https://portal.nutanix.com/page/documents/details?targetId=Prism-Central-Guide-vpc_7_3%3Amul-recovery-pointintime-Objects-pcbr-pe-t.html
+14. Nutanix Ansible Collection（nutanix.ncp）— ntnx_recovery_plan_jobs（アクション VALIDATE / MIGRATE / FAILOVER / TEST_FAILOVER / LIVE_MIGRATE / CLEANUP。CLEANUP はテストフェイルオーバー作成エンティティの掃除用）. https://galaxy.ansible.com/ui/repo/published/nutanix/ncp/content/module/ntnx_recovery_plan_jobs/
+12. Broadcom KB — SRM × Nutanix AOS で VM が NIC 切断のまま起動失敗する事象（正しいポートグループを手動割当 → Recovery Plan を再実行）. https://knowledge.broadcom.com/external/article/313975/
+5. Nutanix.dev — Enterprise Grade Replication and Disaster Recovery（DR = レプリケーション＋オーケストレーション、Recovery Plan の runbook / 電源投入順 / post-boot スクリプト）. https://www.nutanix.dev/2022/09/08/nutanix-benefit-5-enterprise-grade-replication-and-disaster-recovery/
+15. endoflife.date — Nutanix Prism Central（リリース / サポートスケジュール）. https://endoflife.date/nutanix-prism
+
+### 二次 / 裏取り
+
+6. egroup-us — Nutanix DR Failover: Planned vs Unplanned（最終リカバリポイント生成、redirect-on-write instant clone、planned の自動ソースクリーンアップ、planned/unplanned の RPO 差）. https://www.egroup-us.com/news/nutanix-dr-planned-vs-unplanned-failovers/
+7. Nutanix Community — Test Failover が使うリカバリポイント（failover は常に最新のリカバリポイントを使用、planned failover は新規スナップショットを作成しデータロスなし）. https://next.nutanix.com/nutanix-disaster-recovery-29/how-to-know-test-failover-brings-which-recover-point-for-disaster-recovery-formerly-leap-43139
+8. Expedient KB — Nutanix Private Cloud DR（Test Failover はリカバリポイントから source VM のコピーを隔離ネットワークで起動）. https://kb.expedient.com/docs/nutanix-disaster-recovery
+13. vmscrub — Configuring Nutanix AHV Metro Availability（テストは Nutanix-Test プレフィックスの複製 VM を作成、Clean-up Test Entities で削除。unplanned のソース側オーファンはプライマリ復帰後に自動掃除）. https://vmscrub.com/configuring-nutanix-ahv-metro-availability/
+16. itskimpossible — Snapshots and recovery points（リカバリポイントからのクローンは新 UUID になる）. https://itskimpossible.blog/snapshots-and-recovery-points/
+- mikedent.io — Nutanix DR: Planned vs Unplanned Failovers（planned の自動ソースクリーンアップ、最終スナップショット）. https://mikedent.io/post/2025/10/nutanix-dr-planned-vs-unplanned-failover/
+- mikedent.io — Nutanix Recovery Plans: Orchestrating DR Failover（failover は最新スナップショットを使用、Protection Policy 前提）. https://mikedent.io/post/2025/10/nutanix-dr-recovery-plans/
+- mikedent.io — Nutanix Automation Tools Compared（v4 は Prism Element に展開しない方針、deprecate ≠ 即削除）. https://mikedent.io/post/2026/2/nutanix-api-automation/
+- vmwaremine — Nutanix DR Runbooks（Recovery Plan の電源投入順・ネットワークマッピング、最大 25 ステージ）. https://www.vmwaremine.com/2019/02/26/nutanix-dr-runbooks-part-2/
+- Dartmouth KB — Nutanix: VM Recovery Point の取得・復元の操作経路（VMs > Recovery Points タブ）. https://services.dartmouth.edu/TDClient/1806/Portal/KB/Article/152418/Nutanix-How-to-take-and-restore-a-VM-Recovery-Point-aka-Snapshot
