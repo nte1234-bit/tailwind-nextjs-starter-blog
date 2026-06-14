@@ -1,0 +1,135 @@
+---
+title: '421 Misdirected Request で閲覧不能になった ― Apache 2.4 の SNI 厳格化と ALB 構成'
+date: '2026-06-07'
+tags: ['Apache', 'AWS', 'ALB', 'SNI', 'troubleshooting']
+draft: false
+summary: 'ALB + EC2(Apache) + ACM 構成のサイトが、ある日突然 421 Misdirected Request で閲覧不能になる事象。原因は Apache 2.4.64 の SNI チェック厳格化。事象・原因・解決策を出典付きで整理する。'
+---
+
+## サマリ
+
+ALB + EC2(Apache) + ACM という構成のサイトで、ある日突然 `421 Misdirected Request` が出て閲覧不能になることがある。原因は Apache のアップデート(2.4.64)による SNI チェックの厳格化。この記事では、事象・421 とは何か・原因・解決策を、出典付きで整理する。
+
+ALB + Apache の SSL パススルー構成を組んでいる人が、ある日 OS のパッケージ更新後に遭遇しうる事象なので、同じ構成の人の参考になればと思う。
+
+## 事象
+
+- **構成**: ALB + EC2(Apache) + ACM
+- **症状**: サイトにアクセスすると `421 Misdirected Request` が表示され、閲覧できない
+
+ブラウザに出るメッセージ:
+
+```text
+Misdirected Request
+The client needs a new connection for this request as the requested host name
+does not match the Server Name Indication (SNI) in use for this connection.
+```
+
+設定を特に変更していないのに、ある日を境に閲覧不能になる、というのが特徴的なパターン。
+
+## 421 Misdirected Request とは何か
+
+### 定義
+
+`421 Misdirected Request` は HTTP のクライアントエラーステータスコードのひとつ。**リクエストが、それに対する応答を生成できないサーバに送られた**ことを示す[^mdn]。
+
+具体的には、リクエスト URI に含まれる scheme(http/https)と authority(ホスト名)の組み合わせに対して、サーバが応答するように構成されていない場合に返される[^mdn]。クライアントは別の接続でリクエストを再試行してよい、とされている。仕様上の定義は RFC 9110(HTTP Semantics)にある[^rfc]。
+
+### どんな時に起きるのか
+
+典型的なのは、**接続の再利用(connection reuse)と SNI が絡む場面**だ[^mdn]。
+
+- 1つの IP アドレスで複数のドメインをホストしている(SNI でドメインを出し分けている)
+- ワイルドカード証明書(`*.example.com`)で、1つの接続を `abc.example.com` と `def.example.com` で使い回す
+- このとき、サーバがドメインの切り替えを正しく処理できないと、421 を返す
+
+ここで鍵になるのが SNI(Server Name Indication)という仕組みだ。
+
+### SNI(Server Name Indication)とは
+
+SNI は TLS プロトコルの拡張で、**クライアントが TLS ハンドシェイクの最初の段階で「どのホスト名に接続したいか」をサーバに伝える**仕組み[^sni]。
+
+これにより、1つの IP アドレスで複数のドメインをホストし、ドメインごとに異なる SSL 証明書を返すことができる。SNI がなければ、サーバはどの証明書を返せばいいか判断できない。
+
+つまり 421 は、ざっくり言うと「**TLS ハンドシェイクで伝えられたホスト名(SNI)と、実際に来た HTTP リクエストのホスト名(Host ヘッダー)が食い違っている**」ときに、サーバが「このリクエストは私宛じゃない」と突き返す状態だ。
+
+## 原因
+
+### Apache 2.4.64 で SNI チェックが厳格化された
+
+**Apache HTTP Server 2.4.64(2025年7月10日リリース)で、SNI の取り扱いが厳格化された**ことが原因になっているケースが多い[^deflect]。
+
+具体的には、この更新により Apache は、**TLS ハンドシェイクの SNI 名と、HTTP パケットの Host ヘッダーが一致しない接続を拒否するようになった**[^deflect]。
+
+Apache のログには、次のようなメッセージが出る[^bitninja]:
+
+```text
+AH02032: Hostname (default host as no SNI was provided) and hostname
+www.example.com provided via HTTP have no compatible SSL setup
+```
+
+### なぜ ALB 構成で多発したのか
+
+この問題は、**ロードバランサーやリバースプロキシを挟む構成**で多発した。理由は、**多くのプロキシがバックエンドへの接続時に SNI を転送しない**から。
+
+AWS の ALB / ELB も同様で、**ALB はバックエンド(Apache)への接続時に、元のリクエストの SNI を転送しない**[^awsrepost]。そのため、Apache から見ると「SNI が来ていない、または Host ヘッダーと一致しない」状態になり、2.4.64 以降の厳格化されたチェックに引っかかって 421 を返す。
+
+設定を変えていないのに突然壊れるのは、**OS のパッケージ更新で Apache が 2.4.64 に上がり、それまで「たまたま動いていた」設定が厳格化によって弾かれるようになる**ためだ。
+
+> **補足: CVE との関係について**
+>
+> この SNI 厳格化を「CVE-2024-38474 / 38475 / 38476 への対応」と説明している記事が散見されるが、これらの CVE は mod_rewrite / mod_proxy のパス処理に関する別件であり、SNI 厳格化とは直接の関係はない[^apachevuln]。2.4.64 は SSL/TLS まわりの複数の修正を含むリリースであり、SNI と Host ヘッダーの整合性チェック強化はその一部である。二次情報の CVE 紐付けはやや不正確なので、原因は「2.4.64 での SNI 取り扱いの厳格化」と理解するのが正しい。
+
+## 解決策
+
+### 対処の選択肢
+
+この事象への対処は、大きく次のいずれかになる。
+
+**選択肢1: ロードバランサーで SSL を終端し、バックエンドへは HTTP で転送する**
+
+ALB 側で HTTPS を終端してしまえば、Apache へは HTTP(80)で転送されるため、Apache 側で SNI 不一致が発生しなくなる。証明書も ALB 側に集約でき、管理負担が減る。最も推奨される構成とされている[^saizou]。
+
+```text
+クライアント → ALB(443, SSL終端) → Apache(80, HTTP)
+```
+
+**選択肢2: `SSLStrictSNIVHostCheck off` を設定する**
+
+Apache 側で SNI の厳格チェックを無効化する設定。メイン設定と各 VirtualHost に `SSLStrictSNIVHostCheck off` を追加する[^awsrepost2]。ただし、これは厳格化された挙動をオフにするものなので、根本対応というより緩和策。
+
+**選択肢3: Apache をバージョンダウンする**
+
+2.4.63 以前に戻せば回避できるが、**セキュリティ修正を取り消すことになるため、あくまで暫定対応**[^saizou]。再度パッケージ更新が走ると再発する。
+
+**選択肢4: ALB を介さない構成にする**
+
+小規模なサイトであれば、ALB を挟まず EC2 直 + Certbot(Let's Encrypt)という構成も選択肢になる。ALB を経由しないため SNI 転送の問題自体が発生しない。ただし、可用性やスケーラビリティは ALB 構成に劣るため、規模と要件に応じて判断する。
+
+### デフォルト VirtualHost のケア
+
+どの選択肢を取るにしても、**デフォルトの VirtualHost を適切に設定しておく**ことは重要だ。SNI が提供されない、あるいは一致しないリクエストが来たときに、デフォルト VirtualHost が適切に応答できるようにしておくと、想定外のリクエストでも 421 ではなく正常なレスポンスを返せる。
+
+## 学び・次回への教訓
+
+**ミドルウェアの自動アップデートや仕様変更により、既存の設定が意図せず無効化されるリスクがある。**
+
+この事象の本質は、「設定を何も変えていないのに壊れた」ように見えて、実際には **OS のパッケージ更新で Apache が 2.4.64 に上がり、セキュリティ厳格化によって"たまたま動いていた"設定が弾かれた**というものだ。
+
+教訓としては:
+
+- **リリースノートの確認**: 特に SSL/TLS まわりの挙動変更は、構成全体に影響しうる
+- **デフォルト設定のケア**: SNI が提供されないケースに備え、デフォルト VirtualHost を適切に設定しておく
+- **構成のシンプル化**: 小規模サイトであれば、ALB を挟まず EC2 直 + Certbot のほうが、SNI 転送問題を避けられる場合がある
+
+「動いていたものが、自分が触っていないのに壊れた」ときは、**裏で何かが更新されていないか**を真っ先に疑うべき、という当たり前の話でもある。
+
+[^mdn]: [421 Misdirected Request - HTTP | MDN](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Status/421)
+[^rfc]: [RFC 9110: HTTP Semantics - 421 Misdirected Request](https://www.rfc-editor.org/rfc/rfc9110#name-421-misdirected-request)
+[^sni]: [SNIとは？TLS Server Name Indicationの仕組み | Cloudflare](https://www.cloudflare.com/ja-jp/learning/ssl/what-is-sni/)
+[^deflect]: [Troubleshooting SNI and 421 Misdirected Request - Deflect](https://deflect.ca/docs/troubleshooting-sni-and-421-misdirected-request/)
+[^bitninja]: [The Latest Apache Update: A 421 Misdirected Request Crisis - BitNinja Security](https://bitninja.com/blog/the-latest-apache-update-a-421-misdirected-request-crisis/)
+[^awsrepost]: [Misdirected Request ... Apache 2.4.52 - AWS re:Post](https://repost.aws/questions/QUo5zj15ydRQS0yRLU8JKd2w/misdirected-request-the-client-needs-a-new-connection-for-this-request-as-the-requested-host-name-does-not-match-the-server-name-indication-sni-in-use-for-this-connection-apache-2-4-52)
+[^awsrepost2]: [Apache 2.4.46 & ELB - AWS re:Post](https://repost.aws/questions/QUbWv0O9GoQ1yN1a9apWfH7Q/apache-2-4-46-elb)
+[^saizou]: [ALB→Apache443 の構成で 421 Misdirected Request が発生する理由 - Zenn(saizou)](https://zenn.dev/saizou/articles/421-20251207)
+[^apachevuln]: [Apache HTTP Server 2.4 vulnerabilities - The Apache HTTP Server Project](https://httpd.apache.org/security/vulnerabilities_24.html)
